@@ -274,6 +274,9 @@ type testErrMsgCase struct {
 func (s *testParserSuite) RunTest(c *C, table []testCase) {
 	parser := parser.New()
 	for _, t := range table {
+		if t.src == "select * from t1 join t2 left join t3 on t2.id = t3.id" {
+			println("here")
+		}
 		_, _, err := parser.Parse(t.src, "", "")
 		comment := Commentf("source %v", t.src)
 		if !t.ok {

@@ -3802,7 +3802,6 @@ IndexHintListOpt:
 	{
 		$$ = $1
 	}
-
 JoinTable:
 	/* Use %prec to evaluate production TableRef before cross join */
 	TableRef CrossOpt TableRef %prec tableRefPriority
@@ -3810,7 +3809,21 @@ JoinTable:
 		$$ = &ast.Join{Left: $1.(ast.ResultSetNode), Right: $3.(ast.ResultSetNode), Tp: ast.CrossJoin}
 	}
 	/* Your code here. */
-
+	/* 是否考虑全连接(full)和交叉连接(cross)和自然连接(natural)和 using？ parser/ast/dml.go */
+|	TableRef CrossOpt TableRef "ON" Expression
+	{
+		$$ = &ast.Join{Left: $1.(ast.ResultSetNode), Right: $3.(ast.ResultSetNode), Tp: ast.CrossJoin, On: &ast.OnCondition{Expr: $5}}
+	}
+|	TableRef JoinType "JOIN" TableRef "ON" Expression
+	{
+		on := &ast.OnCondition{Expr: $6}
+		$$ = &ast.Join{Left: $1.(ast.ResultSetNode), Right: $4.(ast.ResultSetNode), Tp: $2.(ast.JoinType), On: on}
+	}
+|	TableRef JoinType OuterOpt "JOIN" TableRef "ON" Expression
+	{
+		on := &ast.OnCondition{Expr: $7}
+                $$ = &ast.Join{Left: $1.(ast.ResultSetNode), Right: $5.(ast.ResultSetNode), Tp: $2.(ast.JoinType), On: on}
+	}
 JoinType:
 	"LEFT"
 	{
