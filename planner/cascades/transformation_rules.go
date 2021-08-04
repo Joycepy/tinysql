@@ -21,12 +21,12 @@ import (
 	"github.com/pingcap/tidb/util/ranger"
 )
 
-// Transformation defines the interface for the transformation rules.
+// Transformation defines the interface for the transformation rules. 定义一个逻辑变换规则
 type Transformation interface {
-	// GetPattern gets the cached pattern of the rule.
+	// GetPattern gets the cached pattern of the rule. 在 Cascades 中，每个 rule 都会匹配一个局部的 Expression 子树，这里的 GetPattern() 就是返回这个 rule 所要匹配的 Pattern。
 	GetPattern() *memo.Pattern
 	// Match is used to check whether the GroupExpr satisfies all the requirements of the transformation rule.
-	//
+	// 在命中 Pattern 后再做的一些更具体的判断
 	// The pattern only identifies the operator type, some transformation rules also need
 	// detailed information for certain plan operators to decide whether it is applicable.
 	Match(expr *memo.ExprIter) bool
@@ -194,6 +194,15 @@ func (r *PushSelDownIndexScan) OnTransform(old *memo.ExprIter) (newExprs []*memo
 		}
 	}
 	// TODO: `res` still has some unused fields: EqOrInCount, IsDNFCond.
+	//   e.g. if there're a in (1, 2, 3) and a in (2, 3, 4). This two will be combined to a in (2, 3)
+	if res.EqOrInCount >0 && !res.IsDNFCond{
+		accesses, filters, newConditions, isNil := ranger.ExtractEqAndInCondition(is.SCtx(),conditions,is.IdxCols,is.IdxColLens)
+		if isNil{
+			return nil, true, true, nil
+		}
+		res.AccessConds=append(newConditions,accesses...)
+		res.RemainedConds = append(res.RemainedConds, filters...)
+	}
 	newIs := plannercore.LogicalIndexScan{
 		Source:         is.Source,
 		IsDoubleRead:   is.IsDoubleRead,
@@ -495,7 +504,66 @@ func NewRulePushSelDownAggregation() Transformation {
 // or just keep the selection unchanged.
 func (r *PushSelDownAggregation) OnTransform(old *memo.ExprIter) (newExprs []*memo.GroupExpr, eraseOld bool, eraseAll bool, err error) {
 	// TODO: implement the algo according to the header comment.
-	return []*memo.GroupExpr{old.GetExpr()}, false, false, nil
+	sel := old.GetExpr().ExprNode.(*plannercore.LogicalSelection)
+	agg := old.Children[0].GetExpr().ExprNode.(*plannercore.LogicalAggregation)
+	aggSchema := old.Children[0].Prop.Schema
+	var pushedExprs []expression.Expression
+	var remainedExprs []expression.Expression
+	exprsOriginal := make([]expression.Expression, 0, len(agg.AggFuncs))
+	for _, aggFunc := range agg.AggFuncs {
+		exprsOriginal = append(exprsOriginal, aggFunc.Args[0])
+	}
+	groupByColumns := expression.NewSchema(agg.GetGroupByCols()...)
+	for _, cond := range sel.Conditions {
+		switch cond.(type) {
+		case *expression.Constant:
+			// Consider SQL list "select sum(b) from t group by a having 1=0". "1=0" is a constant predicate which should be
+			// retained and pushed down at the same time. Because we will get a wrong query result that contains one column
+			// with value 0 rather than an empty query result.
+			pushedExprs = append(pushedExprs, cond)
+			remainedExprs = append(remainedExprs, cond)
+		case *expression.ScalarFunction:
+			extractedCols := expression.ExtractColumns(cond)
+			canPush := true
+			for _, col := range extractedCols {
+				if !groupByColumns.Contains(col) {
+					canPush = false
+					break
+				}
+			}
+			if canPush {
+				newCond := expression.ColumnSubstitute(cond, aggSchema, exprsOriginal)
+				pushedExprs = append(pushedExprs, newCond)
+			} else {
+				remainedExprs = append(remainedExprs, cond)
+			}
+		default:
+			remainedExprs = append(remainedExprs, cond)
+		}
+	}
+	// If no condition can be pushed, keep the selection unchanged.
+	if len(pushedExprs) == 0 {
+		return nil, false, false, nil
+	}
+	sctx := sel.SCtx()
+	childGroup := old.Children[0].GetExpr().Children[0]
+	pushedSel := plannercore.LogicalSelection{Conditions: pushedExprs}.Init(sctx)
+	pushedGroupExpr := memo.NewGroupExpr(pushedSel)
+	pushedGroupExpr.SetChildren(childGroup)
+	pushedGroup := memo.NewGroupWithSchema(pushedGroupExpr, childGroup.Prop.Schema)
+
+	aggGroupExpr := memo.NewGroupExpr(agg)
+	aggGroupExpr.SetChildren(pushedGroup)
+
+	if len(remainedExprs) == 0 {
+		return []*memo.GroupExpr{aggGroupExpr}, true, false, nil
+	}
+
+	aggGroup := memo.NewGroupWithSchema(aggGroupExpr, aggSchema)
+	remainedSel := plannercore.LogicalSelection{Conditions: remainedExprs}.Init(sctx)
+	remainedGroupExpr := memo.NewGroupExpr(remainedSel)
+	remainedGroupExpr.SetChildren(aggGroup)
+	return []*memo.GroupExpr{remainedGroupExpr}, true, false, nil
 }
 
 // TransformLimitToTopN transforms Limit+Sort to TopN.
@@ -598,6 +666,62 @@ func (r *PushSelDownJoin) OnTransform(old *memo.ExprIter) (newExprs []*memo.Grou
 		join.OtherConditions = otherCond
 		leftCond = leftPushCond
 		rightCond = rightPushCond
+	case plannercore.LeftOuterJoin,
+		plannercore.RightOuterJoin:
+		lenJoinConds := len(join.EqualConditions) + len(join.LeftConditions) + len(join.RightConditions) + len(join.OtherConditions)
+		joinConds := make([]expression.Expression, 0, lenJoinConds)
+		for _, equalCond := range join.EqualConditions {
+			joinConds = append(joinConds, equalCond)
+		}
+		joinConds = append(joinConds, join.LeftConditions...)
+		joinConds = append(joinConds, join.RightConditions...)
+		joinConds = append(joinConds, join.OtherConditions...)
+		join.EqualConditions = nil
+		join.LeftConditions = nil
+		join.RightConditions = nil
+		join.OtherConditions = nil
+		remainCond := make([]expression.Expression, len(sel.Conditions))
+		copy(remainCond, sel.Conditions)
+		rightSchema := rightGroup.Prop.Schema
+		leftSchema := leftGroup.Prop.Schema
+		if join.JoinType == plannercore.RightOuterJoin {
+			joinConds, remainCond = expression.PropConstOverOuterJoin(join.SCtx(), joinConds, remainCond, rightSchema, leftSchema)
+		} else {
+			joinConds, remainCond = expression.PropConstOverOuterJoin(join.SCtx(), joinConds, remainCond, leftSchema, rightSchema)
+		}
+		eq, left, right, other := join.ExtractOnCondition(joinConds, leftSchema, rightSchema, false, false)
+		join.EqualConditions=append(eq,join.EqualConditions...)
+		join.LeftConditions=append(left,join.LeftConditions...)
+		join.RightConditions=append(right,join.RightConditions...)
+		join.OtherConditions=append(other,join.OtherConditions...)
+		// Return table dual when filter is constant false or null.
+		dual := plannercore.Conds2TableDual(join, remainCond)
+		if dual != nil {
+			return []*memo.GroupExpr{memo.NewGroupExpr(dual)}, false, true, nil
+		}
+		if join.JoinType == plannercore.RightOuterJoin {
+			remainCond = expression.ExtractFiltersFromDNFs(join.SCtx(), remainCond)
+			// Only derive right where condition, because left where condition cannot be pushed down
+			equalCond, leftPushCond, rightPushCond, otherCond = join.ExtractOnCondition(remainCond, leftSchema, rightSchema, false, true)
+			rightCond = rightPushCond
+			// Handle join conditions, only derive left join condition, because right join condition cannot be pushed down
+			derivedLeftJoinCond, _ := plannercore.DeriveOtherConditions(join, leftSchema, rightSchema, true, false)
+			leftCond = append(join.LeftConditions, derivedLeftJoinCond...)
+			join.LeftConditions = nil
+			remainCond = append(expression.ScalarFuncs2Exprs(equalCond), otherCond...)
+			remainCond = append(remainCond, leftPushCond...)
+		} else {
+			remainCond = expression.ExtractFiltersFromDNFs(join.SCtx(), remainCond)
+			// Only derive left where condition, because right where condition cannot be pushed down
+			equalCond, leftPushCond, rightPushCond, otherCond = join.ExtractOnCondition(remainCond, leftSchema, rightSchema, true, false)
+			leftCond = leftPushCond
+			// Handle join conditions, only derive right join condition, because left join condition cannot be pushed down
+			_, derivedRightJoinCond := plannercore.DeriveOtherConditions(join, leftSchema, rightSchema, false, true)
+			rightCond = append(join.RightConditions, derivedRightJoinCond...)
+			join.RightConditions = nil
+			remainCond = append(expression.ScalarFuncs2Exprs(equalCond), otherCond...)
+			remainCond = append(remainCond, rightPushCond...)
+		}
 	default:
 		// TODO: Enhance this rule to deal with LeftOuter/RightOuter/Semi/SmiAnti/LeftOuterSemi/LeftOuterSemiAnti Joins.
 	}
@@ -798,5 +922,29 @@ func (r *MergeAggregationProjection) Match(old *memo.ExprIter) bool {
 // It will transform `Aggregation->Projection->X` to `Aggregation->X`.
 func (r *MergeAggregationProjection) OnTransform(old *memo.ExprIter) (newExprs []*memo.GroupExpr, eraseOld bool, eraseAll bool, err error) {
 	// TODO: implement the body according to the header comment.
-	return []*memo.GroupExpr{old.GetExpr()}, false, false, nil
+	oldAgg := old.GetExpr().ExprNode.(*plannercore.LogicalAggregation)
+	project := old.Children[0].GetExpr().ExprNode.(*plannercore.LogicalProjection)
+	projectSchema := old.Children[0].GetExpr().Schema()
+	groupByItems := make([]expression.Expression, len(oldAgg.GroupByItems))
+	for i, item := range oldAgg.GroupByItems{
+		groupByItems[i] = expression.ColumnSubstitute(item, projectSchema, project.Exprs)
+	}
+
+	aggFuncs := make([]*aggregation.AggFuncDesc, len(oldAgg.AggFuncs))
+	for i, aggFunc := range oldAgg.AggFuncs{
+		aggFuncs[i] = aggFunc.Clone()
+		newArgs := make([]expression.Expression, len(aggFunc.Args))
+		for j, arg := range aggFunc.Args {
+			newArgs[j] = expression.ColumnSubstitute(arg,projectSchema,project.Exprs)
+		}
+		aggFuncs[i].Args=newArgs
+	}
+
+	newAgg := plannercore.LogicalAggregation{
+		GroupByItems: groupByItems,
+		AggFuncs: aggFuncs,
+	}.Init(oldAgg.SCtx())
+	newAggExpr := memo.NewGroupExpr(newAgg)
+	newAggExpr.SetChildren(old.Children[0].GetExpr().Children...)
+	return []*memo.GroupExpr{newAggExpr}, true, false, nil
 }

@@ -356,7 +356,38 @@ func (la *LogicalAggregation) PredicatePushDown(predicates []expression.Expressi
 	// TODO: Here you need to push the predicates across the aggregation.
 	//       A simple example is that `select * from (select count(*) from t group by b) tmp_t where b > 1` is the same with
 	//       `select * from (select count(*) from t where b > 1 group by b) tmp_t.
-	return predicates, la
+	var condToPush []expression.Expression
+	exprOld := make([]expression.Expression,0,len(la.AggFuncs))
+	for _, f := range la.AggFuncs{
+		exprOld = append(exprOld, f.Args[0])
+	}
+	groupByColumns := expression.NewSchema(la.groupByCols...)
+	for _, cond := range predicates{
+		switch cond.(type){
+		case *expression.Constant:
+			condToPush=append(condToPush, cond)
+			ret = append(ret, cond)
+		case *expression.ScalarFunction:
+			extractCols := expression.ExtractColumns(cond)
+			ok := true
+			for _, col := range extractCols{
+				if !groupByColumns.Contains(col){
+					ok =false
+					break
+				}
+			}
+			if ok{
+				newFunc :=expression.ColumnSubstitute(cond,la.Schema(),exprOld)
+				condToPush= append(condToPush,newFunc)
+			}else{
+				ret=append(ret,cond)
+			}
+		default:
+			ret=append(ret,cond)
+		}
+	}
+	la.baseLogicalPlan.PredicatePushDown(condToPush)
+	return ret, la
 }
 
 // PredicatePushDown implements LogicalPlan PredicatePushDown interface.
@@ -469,4 +500,44 @@ func (p *LogicalMemTable) PredicatePushDown(predicates []expression.Expression) 
 
 func (*ppdSolver) name() string {
 	return "predicate_push_down"
+}
+
+
+// DeriveOtherConditions given a LogicalJoin, check the OtherConditions to see if we can derive more
+// conditions for left/right child pushdown.
+func DeriveOtherConditions(
+	p *LogicalJoin, leftSchema *expression.Schema, rightSchema *expression.Schema,
+	deriveLeft bool, deriveRight bool) (
+	leftCond []expression.Expression, rightCond []expression.Expression) {
+
+	for _, expr := range p.OtherConditions {
+		if deriveLeft {
+			leftRelaxedCond := expression.DeriveRelaxedFiltersFromDNF(expr, leftSchema)
+			if leftRelaxedCond != nil {
+				leftCond = append(leftCond, leftRelaxedCond)
+			}
+			notNullExpr := deriveNotNullExpr(expr, leftSchema)
+			if notNullExpr != nil {
+				leftCond = append(leftCond, notNullExpr)
+			}
+		}
+		if deriveRight {
+			rightRelaxedCond := expression.DeriveRelaxedFiltersFromDNF(expr, rightSchema)
+			if rightRelaxedCond != nil {
+				rightCond = append(rightCond, rightRelaxedCond)
+			}
+			// For LeftOuterSemiJoin and AntiLeftOuterSemiJoin, we can actually generate
+			// `col is not null` according to expressions in `OtherConditions` now, but we
+			// are putting column equal condition converted from `in (subq)` into
+			// `OtherConditions`(@sa https://github.com/pingcap/tidb/pull/9051), then it would
+			// cause wrong results, so we disable this optimization for outer semi joins now.
+			// TODO enable this optimization for outer semi joins later by checking whether
+			// condition in `OtherConditions` is converted from `in (subq)`.
+			notNullExpr := deriveNotNullExpr(expr, rightSchema)
+			if notNullExpr != nil {
+				rightCond = append(rightCond, notNullExpr)
+			}
+		}
+	}
+	return
 }
