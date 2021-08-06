@@ -14,9 +14,9 @@
 package core
 
 import (
-	"github.com/pingcap/errors"
 	"github.com/pingcap/tidb/expression"
 	"github.com/pingcap/tidb/parser/ast"
+	"math/bits"
 )
 
 type joinReorderDPSolver struct {
@@ -44,7 +44,215 @@ func (s *joinReorderDPSolver) solve(joinGroup []LogicalPlan, eqConds []expressio
 	// You'll see some common usages in the greedy version.
 
 	// Note that the join tree may be disconnected. i.e. You need to consider the case `select * from t, t1, t2`.
-	return nil, errors.Errorf("unimplemented")
+	// 使用数字的二进制表示来代表当前参与 Join 的节点情况。f[11] 来表示包含了节点 3, 1, 0 的最优的 Join Tree。转移方程则是 f[group] = min{join{f[sub], f[group ^ sub])} 这里 sub 是 group 二进制表示下的任意子集。
+	for _, node := range joinGroup {
+		_, err := node.recursiveDeriveStats()
+		if err != nil {
+			return nil, err
+		}
+		// Each entry is a logical plan with associated cost
+		s.curJoinGroup = append(s.curJoinGroup, &jrNode{
+			p:       node,
+			cumCost: s.baseNodeCumCost(node),
+		})
+	}
+	// Build a graph that is used for dp
+	adjacents := make([][]int, len(s.curJoinGroup))
+	totalEqEdges := make([]joinGroupEqEdge, 0, len(eqConds))
+	addEqEdge := func(node1, node2 int, edgeContent *expression.ScalarFunction) {
+		totalEqEdges = append(totalEqEdges, joinGroupEqEdge{
+			nodeIDs: []int{node1, node2},
+			edge:    edgeContent,
+		})
+		adjacents[node1] = append(adjacents[node1], node2)
+		adjacents[node2] = append(adjacents[node2], node1)
+	}
+	// Build Graph for join group
+	for _, cond := range eqConds {
+		sf := cond.(*expression.ScalarFunction)
+		lCol := sf.GetArgs()[0].(*expression.Column)
+		rCol := sf.GetArgs()[1].(*expression.Column)
+		lIdx, err := findNodeIndexInGroup(joinGroup, lCol)
+		if err != nil {
+			return nil, err
+		}
+		rIdx, err := findNodeIndexInGroup(joinGroup, rCol)
+		if err != nil {
+			return nil, err
+		}
+		addEqEdge(lIdx, rIdx, sf)
+	}
+	totalNonEqEdges := make([]joinGroupNonEqEdge, 0, len(s.otherConds))
+	// For each condition in s.otherConds, find the columns that related with the condition.
+	// Then iterate through all the columns to store all the index information for the condition.
+	for _, cond := range s.otherConds {
+		cols := expression.ExtractColumns(cond)
+		mask := uint(0)
+		ids := make([]int, 0, len(cols))
+		for _, col := range cols {
+			idx, err := findNodeIndexInGroup(joinGroup, col)
+			if err != nil {
+				return nil, err
+			}
+			ids = append(ids, idx)
+			mask |= 1 << uint(idx)
+		}
+		// nodeIDMask is used to quickly match the subset of the node set. nodeIDs only contains nodeID.
+		totalNonEqEdges = append(totalNonEqEdges, joinGroupNonEqEdge{
+			nodeIDs:    ids,
+			nodeIDMask: mask,
+			expr:       cond,
+		})
+	}
+	visited := make([]bool, len(joinGroup))
+	// The reason why using nodeID2VisitID and visitID2nodeID to map the relationship between nodeID and visitID
+	// is that in bfs not every nodes will be visited, so len(#visitID) <= len(#nodeID).
+	// nodeID2VisitID stores the order of each node being visited in bfs. This is
+	// used in dpGrpah to translate the nodeID mask to visitID mask.
+	nodeID2VisitID := make([]int, len(joinGroup))
+	var joins []LogicalPlan
+	// BFS the tree. For each joinGroup[i], traverse all the reachable nodes. And then combine all the associated otherConds to generate a new join.
+	for i := 0; i < len(joinGroup); i++ {
+		if visited[i] {
+			continue
+		}
+		visitID2NodeID := s.bfsGraph(i, visited, adjacents, nodeID2VisitID)
+		// All the nodes that are visited in dfs, which means all the nodes that are reachable from joinGroup[i]
+		nodeIDMask := uint(0)
+		for _, nodeID := range visitID2NodeID {
+			nodeIDMask |= 1 << uint(nodeID)
+		}
+		var subNonEqEdges []joinGroupNonEqEdge
+		// Iterating by reverse order to remove nonEqEdge from totalNonEqEdges faster.
+		for i := len(totalNonEqEdges) - 1; i >= 0; i-- {
+			// Filter out the totalNonEqEdge that is not a subset of nodes that are reachable from joinGroup[i]
+			if totalNonEqEdges[i].nodeIDMask&nodeIDMask != totalNonEqEdges[i].nodeIDMask {
+				continue
+			}
+			// newMask stores the visitID information
+			newMask := uint(0)
+			for _, nodeID := range totalNonEqEdges[i].nodeIDs {
+				newMask |= 1 << uint(nodeID2VisitID[nodeID])
+			}
+			totalNonEqEdges[i].nodeIDMask = newMask
+			subNonEqEdges = append(subNonEqEdges, totalNonEqEdges[i])
+			totalNonEqEdges = append(totalNonEqEdges[:i], totalNonEqEdges[i+1:]...)
+		}
+		// Do DP on each sub graph.
+		join, err := s.dpGraph(visitID2NodeID, nodeID2VisitID, totalEqEdges, subNonEqEdges)
+		if err != nil {
+			return nil, err
+		}
+		joins = append(joins, join)
+	}
+	remainedOtherConds := make([]expression.Expression, 0, len(totalNonEqEdges))
+	for _, edge := range totalNonEqEdges {
+		remainedOtherConds = append(remainedOtherConds, edge.expr)
+	}
+	// Build bushy tree for cartesian joins.
+	return s.makeBushyJoin(joins, remainedOtherConds), nil
+}
+
+// bfsGraph bfs a sub graph starting at startPos，finds the information regarding the order of each node being visited. And relabel its label for future use.
+func (s *joinReorderDPSolver) bfsGraph(startNode int, visited []bool, adjacents [][]int, nodeID2VisitID []int) []int {
+	queue := []int{startNode}
+	visited[startNode] = true
+	var visitID2NodeID []int
+	for len(queue) > 0 {
+		// Pop the first element from the queue
+		curNodeID := queue[0]
+		queue = queue[1:]
+		// nodeID2VisitID 记录 node 是第多少个被遍历到的
+		// visitID2NodeID 记录遍历得到的的节点顺序
+		nodeID2VisitID[curNodeID] = len(visitID2NodeID)
+		visitID2NodeID = append(visitID2NodeID, curNodeID)
+		for _, adjNodeID := range adjacents[curNodeID] {
+			if visited[adjNodeID] {
+				continue
+			}
+			queue = append(queue, adjNodeID)
+			visited[adjNodeID] = true
+		}
+	}
+	return visitID2NodeID
+}
+
+// dpGraph is the core part of this algorithm.
+// It implements the traditional join reorder algorithm: DP by subset using the following formula:
+//   bestPlan[S:set of node] = the best one among Join(bestPlan[S1:subset of S], bestPlan[S2: S/S1])
+// Recursion function: dp[group] = min{join{dp[sub], dp[group ^ sub]}}
+func (s *joinReorderDPSolver) dpGraph(visitID2NodeID, nodeID2VisitID []int, totalEqEdges []joinGroupEqEdge, totalNonEqEdges []joinGroupNonEqEdge) (LogicalPlan, error) {
+	nodeCnt := uint(len(visitID2NodeID))
+	bestPlan := make([]*jrNode, 1<<nodeCnt)
+	// bestPlan[s] is nil can be treated as bestCost[s] = +inf.
+	for i := uint(0); i < nodeCnt; i++ {
+		bestPlan[1<<i] = s.curJoinGroup[visitID2NodeID[i]]
+	}
+	// Enumerate the nodeBitmap from small to big, make sure that S1 must be enumerated before S2 if S1 belongs to S2.
+	for nodeBitmap := uint(1); nodeBitmap < (1 << nodeCnt); nodeBitmap++ {
+		if bits.OnesCount(nodeBitmap) == 1 {
+			continue
+		}
+		// This loop can iterate all its subset.  The way to enumerate through all possible subset is interesting.
+		for sub := (nodeBitmap - 1) & nodeBitmap; sub > 0; sub = (sub - 1) & nodeBitmap {
+			remain := nodeBitmap ^ sub
+			if sub > remain {
+				continue
+			}
+			// If this subset is not connected skip it.
+			if bestPlan[sub] == nil || bestPlan[remain] == nil {
+				continue
+			}
+			// Get the edge connecting the two parts.
+			usedEdges, otherConds := s.nodesAreConnected(sub, remain, nodeID2VisitID, totalEqEdges, totalNonEqEdges)
+			// Here we only check equal condition currently.
+			if len(usedEdges) == 0 {
+				continue
+			}
+			join, err := s.newJoinWithEdge(bestPlan[sub].p, bestPlan[remain].p, usedEdges, otherConds)
+			if err != nil {
+				return nil, err
+			}
+			curCost := s.calcJoinCumCost(join, bestPlan[sub], bestPlan[remain])
+			if bestPlan[nodeBitmap] == nil {
+				bestPlan[nodeBitmap] = &jrNode{
+					p:       join,
+					cumCost: curCost,
+				}
+			} else if bestPlan[nodeBitmap].cumCost > curCost {
+				bestPlan[nodeBitmap].p = join
+				bestPlan[nodeBitmap].cumCost = curCost
+			}
+		}
+	}
+	return bestPlan[(1<<nodeCnt)-1].p, nil
+}
+
+func (s *joinReorderDPSolver) nodesAreConnected(leftMask, rightMask uint, oldPos2NewPos []int,
+	totalEqEdges []joinGroupEqEdge, totalNonEqEdges []joinGroupNonEqEdge) ([]joinGroupEqEdge, []expression.Expression) {
+	var (
+		usedEqEdges []joinGroupEqEdge
+		otherConds  []expression.Expression
+	)
+	for _, edge := range totalEqEdges {
+		lIdx := uint(oldPos2NewPos[edge.nodeIDs[0]])
+		rIdx := uint(oldPos2NewPos[edge.nodeIDs[1]])
+		if ((leftMask&(1<<lIdx)) > 0 && (rightMask&(1<<rIdx)) > 0) || ((leftMask&(1<<rIdx)) > 0 && (rightMask&(1<<lIdx)) > 0) {
+			usedEqEdges = append(usedEqEdges, edge)
+		}
+	}
+	for _, edge := range totalNonEqEdges {
+		// If the result is false, means that the current group hasn't covered the columns involved in the expression.
+		if edge.nodeIDMask&(leftMask|rightMask) != edge.nodeIDMask {
+			continue
+		}
+		// Check whether this expression is only built from one side of the join.
+		if edge.nodeIDMask&leftMask == 0 || edge.nodeIDMask&rightMask == 0 {
+			continue
+		}
+		otherConds = append(otherConds, edge.expr)
+	}
+	return usedEqEdges, otherConds
 }
 
 func (s *joinReorderDPSolver) newJoinWithEdge(leftPlan, rightPlan LogicalPlan, edges []joinGroupEqEdge, otherConds []expression.Expression) (LogicalPlan, error) {

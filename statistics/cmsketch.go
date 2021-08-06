@@ -14,7 +14,10 @@
 package statistics
 
 import (
+	"github.com/cznic/sortutil"
+	"math"
 	"reflect"
+	"sort"
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/tidb/sessionctx/stmtctx"
@@ -50,6 +53,12 @@ func (c *CMSketch) InsertBytes(bytes []byte) {
 // insertBytesByCount adds the bytes value into the TopN (if value already in TopN) or CM Sketch by delta, this does not updates c.defaultValue.
 func (c *CMSketch) insertBytesByCount(bytes []byte, count uint64) {
 	// TODO: implement the insert method.
+	h1, h2 := murmur3.Sum128(bytes)
+	for i := range c.table {
+		j := (h1 + h2*uint64(i)) % uint64(c.width)
+		c.table[i][j] += uint32(count)
+	}
+	c.count += count
 }
 
 func (c *CMSketch) queryValue(sc *stmtctx.StatementContext, val types.Datum) (uint64, error) {
@@ -68,7 +77,38 @@ func (c *CMSketch) QueryBytes(d []byte) uint64 {
 
 func (c *CMSketch) queryHashValue(h1, h2 uint64) uint64 {
 	// TODO: implement the query method.
-	return uint64(0)
+	/**
+	Count-Min Sketch算法对于低频的元素，结果不太准确，主要是因为hash冲突比较严重，产生了噪音.
+	Count-Mean-Min Sketch 算法做了如下改进：
+	来了一个查询，按照 Count-Min Sketch的正常流程，取出它的d个sketch
+	对于每个hash函数，估算出一个噪音，噪音等于该行所有整数(除了被查询的这个元素)的平均值
+	用该行的sketch 减去该行的噪音，作为真正的sketch
+	返回d个sketch的中位数
+	 */
+	vals := make([]uint32, c.depth)
+	min := uint32(math.MaxUint32)
+	for i := range c.table {
+		j := (h1 + h2*uint64(i)) % uint64(c.width)
+		if min > c.table[i][j] {
+			min = c.table[i][j]
+		}
+		// 用 (N - CM[i, j]) / (w-1)（N 是总共的插入的值数量）作为其他值产生的噪音
+		// 用 CM[i,j] - (N - CM[i, j]) / (w-1) 作为这一行的估计值，然后用所有行的估计值的中位数作为最后的估计值。
+		noise := (c.count - uint64(c.table[i][j])) / (uint64(c.width) - 1)
+		if uint64(c.table[i][j]) < noise {
+			vals[i] = 0
+		} else {
+			vals[i] = c.table[i][j] - uint32(noise)
+		}
+	}
+	sort.Sort(sortutil.Uint32Slice(vals))
+	median := vals[(c.depth-1)/2] + (vals[c.depth/2]-vals[(c.depth-1)/2])/2
+	res := median
+	if res > min {
+		// 可以去掉
+		res = min
+	}
+	return uint64(res)
 }
 
 // MergeCMSketch merges two CM Sketch.

@@ -76,28 +76,28 @@ func DecodeRecordKey(key kv.Key) (tableID int64, handle int64, err error) {
 		return 0, 0, errInvalidRecordKey.GenWithStack("invalid record key - %q", key)
 	}
 
-	k :=key
+	k := key
 	if !hasTablePrefix(k) {
-		return 0,0,errInvalidKey.GenWithStack("invalid key - %q", key)
+		return 0, 0, errInvalidKey.GenWithStack("invalid key - %q", key)
 	}
-	k=k[tablePrefixLength:]
-	k,tableID,err=codec.DecodeInt(k)
-	if err!=nil{
-		return 0,0,errors.Trace(err)
+	k = k[tablePrefixLength:]
+	k, tableID, err = codec.DecodeInt(k)
+	if err != nil {
+		return 0, 0, errors.Trace(err)
 	}
 
-	if !hasRecordPrefixSep(k){
-		return 0,0,errInvalidKey.GenWithStack("invalid key - %q", key)
+	if !hasRecordPrefixSep(k) {
+		return 0, 0, errInvalidKey.GenWithStack("invalid key - %q", key)
 	}
-	k=k[recordPrefixSepLength:]
-	if len(k)==8{
-		k,handle,err=codec.DecodeInt(k)
-		if err!=nil{
-			return 0,0, errors.Trace(err)
+	k = k[recordPrefixSepLength:]
+	if len(k) == 8 {
+		k, handle, err = codec.DecodeInt(k)
+		if err != nil {
+			return 0, 0, errors.Trace(err)
 		}
-		return tableID,handle,nil
+		return tableID, handle, nil
 	}
-	return 0,0,errInvalidKey.GenWithStack("invalid key - %q", key)
+	return 0, 0, errInvalidKey.GenWithStack("invalid key - %q", key)
 }
 
 // appendTableIndexPrefix appends table index prefix  "t[tableID]_i".
@@ -120,16 +120,16 @@ func EncodeIndexSeekKey(tableID int64, idxID int64, encodedValue []byte) kv.Key 
 // DecodeIndexKeyPrefix decodes the key and gets the tableID, indexID, indexValues.
 func DecodeIndexKeyPrefix(key kv.Key) (tableID int64, indexID int64, indexValues []byte, err error) {
 	/* Your code here */
-	k :=key
-	tableID,indexID,isRecord,err:=DecodeKeyHead(k)
-	if err !=nil{
-		return 0,0,nil,errors.Trace(err)
+	k := key
+	tableID, indexID, isRecord, err := DecodeKeyHead(k)
+	if err != nil {
+		return 0, 0, nil, errors.Trace(err)
 	}
-	if isRecord{
-		return 0,0,nil,errInvalidIndexKey.GenWithStack("invalid index key - %q %v", key, err)
+	if isRecord {
+		return 0, 0, nil, errInvalidIndexKey.GenWithStack("invalid index key - %q %v", key, err)
 	}
-	indexValues=k[prefixLen+idLen:]
-	return tableID,indexID,indexValues,nil
+	indexValues = k[prefixLen+idLen:]
+	return tableID, indexID, indexValues, nil
 }
 
 // DecodeIndexKey decodes the key and gets the tableID, indexID, indexValues.
